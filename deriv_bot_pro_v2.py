@@ -3,6 +3,7 @@
 #  Estratégias: Precisão | S/R | Candles | Fibonacci | SMC+Trend
 #  API: Nova Deriv API (PAT → REST → OTP → WebSocket)
 #  v3 — Só Forex & Commodities reais + pares completos + filtro de sessão
+#  FIX: max_wait dinâmico (_MAX_WAIT_MAP) para evitar timeout em TFs 5m/15m/30m/1h
 # =============================================================================
 
 import streamlit as st
@@ -119,6 +120,20 @@ def is_good_session() -> bool:
     if 21 <= hour or hour < 7:
         return False
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX — DURATION → max_wait map (duração real do contrato + margem de 2 min)
+#  Antes: max_wait era fixo em 180s (3 min), insuficiente para TF >= 5m.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MAX_WAIT_MAP = {
+    "1m":  180,    #  1 min + 2 min margem
+    "5m":  420,    #  5 min + 2 min margem  ← cobre o caso do erro reportado
+    "15m": 1020,   # 15 min + 2 min margem
+    "30m": 1920,   # 30 min + 2 min margem
+    "1h":  3720,   # 60 min + 2 min margem
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -740,7 +755,9 @@ class DerivClient:
         if buy.get("error"): raise RuntimeError(buy["error"]["message"])
         return buy["buy"]
 
-    async def get_contract_result(self, contract_id, max_wait=180.0):
+    # ── FIX: max_wait passa a ser recebido de fora (padrão 420s = 5min+margem) ──
+    # Antes estava fixo em 180.0, o que causava timeout para contratos >= 5m.
+    async def get_contract_result(self, contract_id, max_wait=420.0):
         deadline = asyncio.get_event_loop().time() + max_wait
         while asyncio.get_event_loop().time() < deadline:
             resp = await self._send({"proposal_open_contract": 1,
@@ -787,6 +804,8 @@ class DerivBot:
         dur                = config.get("duration", "5m")
         self.dur_val, self.dur_unit = _DURATION_MAP.get(dur, (5,"m"))
         self.granularity   = _GRANULARITY_MAP.get(dur, 300)
+        # ── FIX: max_wait dinâmico de acordo com o timeframe escolhido ──
+        self.max_wait       = _MAX_WAIT_MAP.get(dur, 420)
         engine_class       = ENGINES.get(config.get("estrategia"), EnginePredicao)
         self.engine        = engine_class()
         self.client        = DerivClient(config["api_token"], config["app_id"],
@@ -808,7 +827,8 @@ class DerivBot:
         self.manager.log(
             f"📌 {SYMBOL_LABELS.get(symbol,symbol)} | "
             f"{self.cfg.get('account_type','demo').upper()} | "
-            f"stake=${self.base_stake} | TF={self.cfg.get('duration','5m')}")
+            f"stake=${self.base_stake} | TF={self.cfg.get('duration','5m')} | "
+            f"max_wait={self.max_wait}s")
 
         last_trade_time  = 0.0
         trades_this_hour = []
@@ -897,7 +917,9 @@ class DerivBot:
                     self.manager.log(
                         f"📝 ID:{contract_id} | stake=${self.current_stake:.2f}")
 
-                    result = await self.client.get_contract_result(contract_id)
+                    # ── FIX: usa o max_wait correcto, calculado pelo timeframe ──
+                    result = await self.client.get_contract_result(
+                        contract_id, max_wait=self.max_wait)
                     profit = result["profit"]
                     self.manager.add_trade(symbol, signal.direction,
                                            self.current_stake, profit,
