@@ -1,8 +1,16 @@
 # =============================================================================
 #  SEVEN LEVELS BOT — MA7 + MACD
-#  MODO SNIPER SUICIDA: dispara rápido, 10-15 trades/min, reinveste tudo
-#  Modos: Conservador | Moderado | Suicida | 🎯 SNIPER SUICIDA
+#  Modos: Conservador | Moderado | 🔥 Agressivo Controlado
 #  API: Nova Deriv API (PAT → REST → OTP → WebSocket)
+#
+#  NOTA DE REVISÃO:
+#  O antigo modo "Suicida"/"Sniper Suicida" foi removido e substituído por
+#  "Agressivo Controlado". Esse modo antigo usava min_conf=0.50 (~aposta
+#  aleatória), reinvestia 100% do capital após cada vitória e não tinha
+#  limite de perdas consecutivas — uma combinação que historicamente levou
+#  a perdas consistentes (ver winrate real registado: ~35%). O novo modo
+#  mantém a agressividade (cooldown curto, crescimento de stake) mas com
+#  confiança mínima realista e stop de segurança sempre activo.
 # =============================================================================
 
 import streamlit as st
@@ -51,7 +59,7 @@ VOLATILITY_SYMBOLS = {
 
 SYMBOL_GROUPS = {
     "📊 Volatility (Recomendado)": ["R_10","R_25","R_50","R_75","R_100"],
-    "⚡ Volatility 1s (Sniper)":   ["1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"],
+    "⚡ Volatility 1s":            ["1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"],
     "💥 Crash & Boom":             ["CRASH300","CRASH500","CRASH1000","BOOM300","BOOM500","BOOM1000"],
     "🪜 Step Index":               ["stpRNG"],
     "🦘 Jump Indices":             ["JD10","JD25","JD50","JD75","JD100"],
@@ -59,6 +67,8 @@ SYMBOL_GROUPS = {
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MODOS DO BOT
+#  Todos os modos têm: confiança mínima realista, limite de perdas
+#  consecutivas activo, e crescimento de stake LIMITADO (nunca "tudo").
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODOS = {
@@ -66,33 +76,34 @@ MODOS = {
         "label":       "🟢 Conservador",
         "desc":        "Aposta fixa. Para após N perdas seguidas.",
         "css":         "mode-c",
-        "min_conf":    0.75,
-        "cooldown":    30,    # segundos entre trades
+        "min_conf":    0.78,
+        "cooldown":    30,     # segundos entre trades
         "max_per_min": 2,
+        "growth":      1.0,    # stake nunca cresce — sempre volta ao base
+        "max_mult":    1.0,
     },
     "moderado": {
         "label":       "🟡 Moderado",
-        "desc":        "Cresce 20% por win. Reset em loss.",
+        "desc":        "Cresce 20% por win (tecto 3x). Reset em loss.",
         "css":         "mode-m",
-        "min_conf":    0.65,
+        "min_conf":    0.72,
         "cooldown":    15,
         "max_per_min": 4,
+        "growth":      1.20,
+        "max_mult":    3.0,
     },
-    "suicida": {
-        "label":       "🔴 Suicida",
-        "desc":        "Reinveste TUDO. Uma perda reinicia. Como no vídeo.",
-        "css":         "mode-s",
-        "min_conf":    0.55,
-        "cooldown":    5,
-        "max_per_min": 12,
-    },
-    "sniper": {
-        "label":       "🎯 SNIPER SUICIDA",
-        "desc":        "🔥 MODO MÁXIMO: dispara em cada sinal válido. 10-15 trades/min. Reinveste tudo. Sem cooldown. Alto risco extremo.",
+    "agressivo": {
+        "label":       "🔥 Agressivo Controlado",
+        "desc":        ("Cooldown curto e mais trades/min, mas SEMPRE com stop "
+                         "de perdas consecutivas activo, confiança mínima alta "
+                         "(0.80) e crescimento de stake limitado a 1.5x do "
+                         "capital base — nunca reinveste tudo."),
         "css":         "mode-x",
-        "min_conf":    0.50,  # aceita sinais mais fracos para disparar mais
-        "cooldown":    0,     # sem cooldown — dispara logo
-        "max_per_min": 20,    # sem limite prático
+        "min_conf":    0.80,
+        "cooldown":    8,
+        "max_per_min": 6,
+        "growth":      1.30,   # cresce 30% por win
+        "max_mult":    1.5,    # mas nunca passa de 1.5x a stake base
     },
 }
 
@@ -113,6 +124,22 @@ CONTRACT_DURATIONS = {
     "15m":  (15, "m"),
     "30m":  (30, "m"),
     "1h":   (1,  "h"),
+}
+
+# max_wait realista por duração de contrato (duração real + margem de segurança)
+_MAX_WAIT_MAP = {
+    "1 tique":   30,
+    "2 tiques":  30,
+    "5 tiques":  45,
+    "10 tiques": 60,
+    "15s":  60,
+    "30s":  90,
+    "60s":  150,
+    "2m":   240,
+    "5m":   420,
+    "15m":  1020,
+    "30m":  1920,
+    "1h":   3720,
 }
 
 CHART_GRANULARITY = {
@@ -229,7 +256,7 @@ class MACDIndicator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SevenLevelsEngine:
-    def __init__(self, min_conf=0.55):
+    def __init__(self, min_conf=0.72):
         self.min_conf = min_conf
         self.ma7  = MA7Indicator()
         self.macd = MACDIndicator()
@@ -283,40 +310,49 @@ class SevenLevelsEngine:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  COMPOUNDING MANAGER
+#  COMPOUNDING MANAGER — crescimento sempre limitado, nunca "tudo"
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CompoundingManager:
-    def __init__(self, mode, base_stake):
+    """
+    Gestão de stake por modo.
+    - conservador: stake fixa sempre.
+    - moderado:    cresce growth% por win, com tecto de max_mult vezes a base.
+    - agressivo:   cresce growth% por win, tecto mais alto mas SEMPRE limitado
+                   (max_mult), nunca reinveste o lucro total indefinidamente.
+    Em qualquer modo, uma perda volta sempre à stake base — não há
+    "duplicar para recuperar" (martingale) em nenhum dos modos actuais.
+    """
+    def __init__(self, mode, base_stake, growth=1.0, max_mult=1.0):
         self.mode       = mode
         self.base_stake = base_stake
+        self.growth     = growth
+        self.max_mult   = max_mult
         self.current    = base_stake
         self.level      = 1
         self.peak       = base_stake
-        self.session_pnl= 0.0  # P&L acumulado do modo suicida nesta corrida
+        self.session_pnl= 0.0
 
-    def next_stake(self): return round(max(0.35, self.current), 2)
+    def next_stake(self):
+        cap = round(self.base_stake * self.max_mult, 2)
+        return round(min(max(0.35, self.current), cap), 2)
 
     def on_win(self, profit):
         self.session_pnl += profit
-        if self.mode in ("suicida", "sniper"):
-            self.current = round(self.current + profit, 2)
-            self.peak    = max(self.peak, self.current)
-        elif self.mode == "moderado":
-            self.current = round(min(self.current * 1.20, self.current * 5), 2)
-        else:
-            self.current = self.base_stake
-        self.level += 1
+        cap = round(self.base_stake * self.max_mult, 2)
+        self.current = round(min(self.current * self.growth, cap), 2)
+        self.peak    = max(self.peak, self.current)
+        self.level  += 1
 
     def on_loss(self, loss):
         self.session_pnl -= abs(loss)
-        self.current = self.base_stake
+        self.current = self.base_stake   # reset sempre — sem martingale
         self.level   = 1
 
     def reset(self):
         self.current     = self.base_stake
-        self.level       = 1
-        self.session_pnl = 0.0
+        self.level        = 1
+        self.session_pnl  = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,7 +372,7 @@ class SessionManager:
         self._max_consec    = 0
         self._running       = False
         self._stop_reason   = ""
-        self._trades_min    = deque(maxlen=200)  # timestamps para trades/min
+        self._trades_min    = deque(maxlen=200)
 
     def set_running(self, v, reason=""):
         with self._lock:
@@ -526,7 +562,6 @@ class DerivClient:
         return resp.get("candles",[])
 
     async def subscribe_ticks(self, symbol):
-        """Subscreve ticks em tempo real para o modo sniper"""
         resp=await self._send({"ticks":symbol,"subscribe":1})
         if resp.get("error"): raise RuntimeError(resp["error"]["message"])
 
@@ -585,6 +620,7 @@ class SevenLevelsBot:
         # Contrato
         self.contract_dur = config["contract_duration"]
         self.dur_val, self.dur_unit = CONTRACT_DURATIONS.get(self.contract_dur,(5,"t"))
+        self.max_wait = _MAX_WAIT_MAP.get(self.contract_dur, 300)
 
         # Candles para análise
         self.chart_tf    = config["chart_tf"]
@@ -598,16 +634,19 @@ class SevenLevelsBot:
 
         # Engine com confiança mínima do modo
         self.engine   = SevenLevelsEngine(min_conf=self.modo_cfg["min_conf"])
-        self.compound = CompoundingManager(mode=self.mode, base_stake=self.base_stake)
+        self.compound = CompoundingManager(
+            mode=self.mode, base_stake=self.base_stake,
+            growth=self.modo_cfg["growth"], max_mult=self.modo_cfg["max_mult"])
         self.client   = DerivClient(config["api_token"],config["app_id"],
                                     config.get("account_type","demo"))
         self.candles  = []
-        self._in_trade = False  # evitar dois trades ao mesmo tempo
+        self._in_trade = False
 
     def stop(self): self._stop = True
 
     async def _check_limits(self):
-        """Retorna (parar, razão) se atingiu algum limite."""
+        """Retorna (parar, razão) se atingiu algum limite.
+        Em TODOS os modos — incluindo o agressivo — este check corre sempre."""
         pnl   = self.manager.pnl()
         stats = self.manager.stats()
 
@@ -615,14 +654,13 @@ class SevenLevelsBot:
             return True, f"🎯 META ATINGIDA! Ganho: +${pnl:.2f} / Meta: +${self.goal_pnl:.2f}"
         if pnl <= -self.stop_pnl:
             return True, f"🛑 STOP LOSS! Perda: -${abs(pnl):.2f} / Limite: -${self.stop_pnl:.2f}"
-        if stats["consec_losses"] >= self.max_consec and self.mode not in ("suicida","sniper"):
-            return True, f"🛑 {stats['consec_losses']} perdas consecutivas!"
+        if stats["consec_losses"] >= self.max_consec:
+            return True, f"🛑 {stats['consec_losses']} perdas consecutivas — parado por segurança!"
         return False, ""
 
     async def _execute_trade(self, signal):
-        """Executa um trade e regista o resultado."""
         if self._in_trade:
-            return  # já há um trade a decorrer
+            return
         self._in_trade = True
         stake = self.compound.next_stake()
         level = self.compound.level
@@ -636,7 +674,8 @@ class SevenLevelsBot:
                 stake, self.dur_val, self.dur_unit)
             contract_id = buy_info.get("contract_id")
 
-            result  = await self.client.get_contract_result(contract_id)
+            result  = await self.client.get_contract_result(
+                contract_id, max_wait=self.max_wait)
             profit  = result["profit"]
 
             self.manager.add_trade(
@@ -648,7 +687,8 @@ class SevenLevelsBot:
                 self.manager.log(
                     f"✅ WIN +${profit:.2f} | "
                     f"Nv{self.compound.level} | "
-                    f"Próx: ${self.compound.current:.2f} | "
+                    f"Próx: ${self.compound.current:.2f} (máx permitido: "
+                    f"${self.base_stake*self.modo_cfg['max_mult']:.2f}) | "
                     f"P&L: ${self.manager.pnl():+.2f}")
             else:
                 self.compound.on_loss(abs(profit))
@@ -665,14 +705,13 @@ class SevenLevelsBot:
     async def run(self):
         label     = VOLATILITY_SYMBOLS.get(self.symbol, self.symbol)
         cooldown  = self.modo_cfg["cooldown"]
-        is_sniper = self.mode == "sniper"
+        is_aggro  = self.mode == "agressivo"
 
         self.manager.set_running(True)
-        self.manager.log(f"🚀 {'🎯 SNIPER SUICIDA' if is_sniper else 'Seven Levels Bot'} INICIADO")
-        self.manager.log(f"📌 {label} | {self.mode.upper()} | Contrato:{self.contract_dur} | Candles:{self.chart_tf}")
-        self.manager.log(f"💰 Stake:${self.base_stake} | Meta:+${self.goal_pnl} | Stop:-${self.stop_pnl}")
-        if is_sniper:
-            self.manager.log("🔥 SNIPER MODE: sem cooldown — dispara em cada sinal válido!")
+        self.manager.log(f"🚀 Seven Levels Bot INICIADO — {self.modo_cfg['label']}")
+        self.manager.log(f"📌 {label} | Contrato:{self.contract_dur} (max_wait={self.max_wait}s) | Candles:{self.chart_tf}")
+        self.manager.log(f"💰 Stake base:${self.base_stake} | Meta:+${self.goal_pnl} | Stop:-${self.stop_pnl} | "
+                          f"Stop consec:{self.max_consec} | tecto stake:{self.modo_cfg['max_mult']}x")
 
         last_trade_time = 0.0
 
@@ -681,7 +720,6 @@ class SevenLevelsBot:
             balance = await self.client.get_balance()
             self.manager.log(f"✅ Conectado | {self.client._account_id} | Saldo:${balance:.2f}")
 
-            # Carregar candles históricos
             raw = await self.client.subscribe_candles(self.symbol, self.granularity)
             for r in raw:
                 self.candles.append(Candle(
@@ -691,71 +729,27 @@ class SevenLevelsBot:
             self.candles = self.candles[-150:]
             self.manager.log(f"📊 {len(self.candles)} candles | aguardando sinais MA7+MACD...")
 
-            # Sniper também subscreve ticks para reagir mais rápido
-            if is_sniper:
-                await self.client.subscribe_ticks(self.symbol)
-                self.manager.log("⚡ Ticks em tempo real activados — modo sniper pronto!")
-
             while not self._stop:
-                # ── Verificar limites ──────────────────────────────────────────
+                # ── Verificar limites — SEMPRE, em qualquer modo ──────────────
                 parar, razao = await self._check_limits()
                 if parar:
                     self.manager.log(razao)
                     self.manager.set_running(False, razao)
                     break
 
-                # ── Aguardar actualização de preço ─────────────────────────────
+                # ── Aguardar candle ────────────────────────────────────────────
                 try:
-                    if is_sniper:
-                        # Sniper: usa ticks (mais rápido) + actualiza candles
-                        try:
-                            tick_msg = await self.client.get_tick(timeout=5.0)
-                            tick     = tick_msg.get("tick",{})
-                            if tick:
-                                price = float(tick.get("quote",0))
-                                epoch = int(tick.get("epoch",0))
-                                # Actualiza o último candle com o tick actual
-                                if self.candles:
-                                    last = self.candles[-1]
-                                    updated = Candle(
-                                        last.open,
-                                        max(last.high, price),
-                                        min(last.low,  price),
-                                        price, epoch)
-                                    self.candles[-1] = updated
-                        except asyncio.TimeoutError:
-                            pass
-
-                        # Também processa candles se chegarem
-                        try:
-                            while not self.client._candles_q.empty():
-                                msg  = self.client._candles_q.get_nowait()
-                                ohlc = msg.get("ohlc",{})
-                                if ohlc:
-                                    c = Candle(
-                                        float(ohlc["open"]),float(ohlc["high"]),
-                                        float(ohlc["low"]), float(ohlc["close"]),
-                                        int(ohlc.get("epoch",0)))
-                                    if not self.candles or c.epoch != self.candles[-1].epoch:
-                                        self.candles.append(c)
-                                        if len(self.candles)>150:
-                                            self.candles=self.candles[-150:]
-                        except: pass
-
-                    else:
-                        # Modos normais: espera candle completo
-                        msg  = await self.client.get_candle_update(timeout=180)
-                        ohlc = msg.get("ohlc",{})
-                        if ohlc:
-                            c = Candle(
-                                float(ohlc["open"]),float(ohlc["high"]),
-                                float(ohlc["low"]), float(ohlc["close"]),
-                                int(ohlc.get("epoch",0)))
-                            if not self.candles or c.epoch!=self.candles[-1].epoch:
-                                self.candles.append(c)
-                                if len(self.candles)>150:
-                                    self.candles=self.candles[-150:]
-
+                    msg  = await self.client.get_candle_update(timeout=180)
+                    ohlc = msg.get("ohlc",{})
+                    if ohlc:
+                        c = Candle(
+                            float(ohlc["open"]),float(ohlc["high"]),
+                            float(ohlc["low"]), float(ohlc["close"]),
+                            int(ohlc.get("epoch",0)))
+                        if not self.candles or c.epoch!=self.candles[-1].epoch:
+                            self.candles.append(c)
+                            if len(self.candles)>150:
+                                self.candles=self.candles[-150:]
                 except asyncio.TimeoutError:
                     self.manager.log("⏳ Aguardando dados...")
                     continue
@@ -770,29 +764,19 @@ class SevenLevelsBot:
                 if signal.direction == "WAIT":
                     continue
 
-                # ── Cooldown (sniper = 0s, outros têm cooldown) ────────────────
+                # ── Cooldown ────────────────────────────────────────────────────
                 now = time.time()
                 if cooldown > 0 and (now - last_trade_time) < cooldown:
                     remaining = int(cooldown - (now - last_trade_time))
                     self.manager.add_signal("WAIT", f"cooldown {remaining}s")
                     continue
 
-                # ── Não abrir se já há trade a decorrer ───────────────────────
                 if self._in_trade:
-                    if is_sniper:
-                        self.manager.add_signal("WAIT", "trade em curso — aguarda")
                     continue
 
                 last_trade_time = now
-
-                # ── Executar (sniper: async sem bloquear o loop) ───────────────
-                if is_sniper:
-                    asyncio.create_task(self._execute_trade(signal))
-                else:
-                    await self._execute_trade(signal)
-
-                # Pequena pausa para não sobrecarregar a API
-                await asyncio.sleep(0.1 if is_sniper else 1)
+                await self._execute_trade(signal)
+                await asyncio.sleep(1)
 
         except Exception as e:
             self.manager.log(f"💥 Erro crítico: {e}")
@@ -823,24 +807,19 @@ html,body,[class*="css"]{font-family:'Space Grotesk',sans-serif;}
 .loss  {color:#ff4d6d;font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;}
 .neutral{color:#7c9cbf;font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;}
 .warn  {color:#f59e0b;font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;}
-.sniper{color:#ff6600;font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;}
 .signal-box {background:#111827;border-left:4px solid #00d4aa;border-radius:8px;padding:8px 12px;margin:3px 0;font-family:'JetBrains Mono',monospace;font-size:.78rem;}
 .signal-sell{border-left-color:#ff4d6d;}
 .signal-wait{border-left-color:#f59e0b;}
 .level-bar{background:#111827;border:1px solid #1e3a5f;border-radius:8px;padding:8px 12px;margin:3px 0;}
 .banner-running {background:linear-gradient(135deg,#003320,#001a10);border:1px solid #00d4aa;border-radius:10px;padding:14px 20px;margin:8px 0;}
-.banner-sniper  {background:linear-gradient(135deg,#2a1000,#1a0800);border:2px solid #ff6600;border-radius:10px;padding:14px 20px;margin:8px 0;animation:pulse 1s infinite;}
 .banner-stopped {background:linear-gradient(135deg,#200a0a,#100505);border:1px solid #ff4d6d;border-radius:10px;padding:14px 20px;margin:8px 0;}
 .banner-goal    {background:linear-gradient(135deg,#1a3300,#0d1a00);border:2px solid #00ff88;border-radius:10px;padding:18px;margin:8px 0;text-align:center;font-size:1.2rem;}
 .mode-c{background:#0d2818;border-left:3px solid #00d4aa;border-radius:6px;padding:8px 12px;font-size:.82rem;color:#a0d8c0;margin:4px 0;}
 .mode-m{background:#1a1a0d;border-left:3px solid #f59e0b;border-radius:6px;padding:8px 12px;font-size:.82rem;color:#d8c8a0;margin:4px 0;}
-.mode-s{background:#200a0a;border-left:3px solid #ff4d6d;border-radius:6px;padding:8px 12px;font-size:.82rem;color:#d8a0a0;margin:4px 0;}
-.mode-x{background:#1a0800;border-left:3px solid #ff6600;border-radius:6px;padding:8px 12px;font-size:.82rem;color:#ffa060;margin:4px 0;}
+.mode-x{background:#1a1306;border-left:3px solid #ff9900;border-radius:6px;padding:8px 12px;font-size:.82rem;color:#ffcb8a;margin:4px 0;}
 .dot-green{width:10px;height:10px;background:#00d4aa;border-radius:50%;display:inline-block;margin-right:6px;}
 .dot-red  {width:10px;height:10px;background:#ff4d6d;border-radius:50%;display:inline-block;margin-right:6px;}
-.dot-orange{width:10px;height:10px;background:#ff6600;border-radius:50%;display:inline-block;margin-right:6px;}
 .stButton>button{background:linear-gradient(135deg,#00d4aa,#0099ff);color:#0a0e1a;font-weight:700;border:none;border-radius:8px;font-size:1rem;padding:10px;}
-@keyframes pulse{0%{border-color:#ff6600;}50%{border-color:#ff9900;}100%{border-color:#ff6600;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -892,27 +871,25 @@ with st.sidebar:
     st.markdown("### 💰 Capital")
     stake = st.number_input(
         "Aposta inicial ($)",
-        min_value=0.35,
-        max_value=10.0 if mode in ("suicida","sniper") else 500.0,
+        min_value=0.35, max_value=500.0,
         value=1.0, step=0.35)
 
     goal = st.number_input(
         "Meta de ganho ($)",
         min_value=0.5,max_value=10000.0,
-        value=1000.0 if mode in ("suicida","sniper") else 10.0,
-        step=1.0,
+        value=10.0, step=1.0,
         help="Bot para quando GANHAR este valor na sessão")
 
     stop_loss = st.number_input(
         "Stop Loss ($)",
         min_value=0.35,max_value=1000.0,
-        value=1.0 if mode in ("suicida","sniper") else 5.0,
-        step=0.35,
+        value=5.0, step=0.35,
         help="Bot para quando PERDER este valor na sessão")
 
-    max_consec = (999 if mode in ("suicida","sniper")
-                  else int(st.number_input("Parar após N perdas seguidas",
-                                           min_value=1,max_value=10,value=3)))
+    max_consec = int(st.number_input(
+        "Parar após N perdas seguidas",
+        min_value=1, max_value=10,
+        value=3 if mode != "agressivo" else 4))
 
     st.markdown("---")
     c1,c2 = st.columns(2)
@@ -920,31 +897,19 @@ with st.sidebar:
     stop_btn  = c2.button("⏹ PARAR", use_container_width=True)
 
 # ── HEADER ────────────────────────────────────────────────────────────────────
-is_sniper  = mode == "sniper"
 sym_label  = VOLATILITY_SYMBOLS.get(symbol, symbol)
 manager    = st.session_state.manager
 is_running = manager.is_running()
 stop_rsn   = manager.stop_reason()
 
-if is_sniper:
-    st.markdown("# 🎯 SNIPER SUICIDA BOT")
-else:
-    st.markdown("# 🎯 Seven Levels Bot")
+st.markdown("# 🎯 Seven Levels Bot")
 st.markdown(f"*MA7+MACD · **{sym_label}** · Contrato:{contract_duration} · Candles:{chart_tf} · {MODOS[mode]['label']}*")
 
-if is_running and is_sniper:
-    tpm = manager.trades_per_min()
-    st.markdown(
-        f'<div class="banner-sniper"><span class="dot-orange"></span>'
-        f'<b>🔥 SNIPER A DISPARAR</b> — {sym_label} | '
-        f'Trades/min: <b>{tpm}</b> | '
-        f'P&L: <b>${manager.pnl():+.2f}</b></div>',
-        unsafe_allow_html=True)
-elif is_running:
+if is_running:
     st.markdown(
         f'<div class="banner-running"><span class="dot-green"></span>'
         f'<b>BOT A OPERAR</b> — {sym_label} | {MODOS[mode]["label"]} | '
-        f'Para quando ganhar ${goal:.2f} ou perder ${stop_loss:.2f}</div>',
+        f'Para quando ganhar ${goal:.2f} ou perder ${stop_loss:.2f} ou {max_consec} perdas seguidas</div>',
         unsafe_allow_html=True)
 elif "META" in stop_rsn:
     st.markdown(f'<div class="banner-goal">🏆 {stop_rsn}</div>',unsafe_allow_html=True)
@@ -981,17 +946,16 @@ with m5:
                 f'<div class="loss">{stats["losses"]}</div></div>',unsafe_allow_html=True)
 with m6:
     cl=stats["consec_losses"]
-    cl_c="loss" if cl>=3 else ("warn" if cl>=2 else "neutral")
+    cl_c="loss" if cl>=max_consec-1 else ("warn" if cl>=max(1,max_consec-2) else "neutral")
     st.markdown(f'<div class="metric-card"><div class="metric-label">CONS.LOSS</div>'
-                f'<div class="{cl_c}">{cl}</div></div>',unsafe_allow_html=True)
+                f'<div class="{cl_c}">{cl}/{max_consec}</div></div>',unsafe_allow_html=True)
 with m7:
-    tpm_c="sniper" if tpm>=8 else ("profit" if tpm>=4 else "neutral")
+    tpm_c="warn" if tpm>=5 else ("profit" if tpm>=2 else "neutral")
     st.markdown(f'<div class="metric-card"><div class="metric-label">TRADES/MIN</div>'
                 f'<div class="{tpm_c}">{tpm}</div></div>',unsafe_allow_html=True)
 
 st.markdown("")
 
-# Barras progresso
 pc1,pc2 = st.columns(2)
 with pc1:
     gp=min(1.0,max(0,stats["pnl"])/goal) if goal>0 else 0
@@ -1019,18 +983,17 @@ with left:
               if c in df.columns]
         st.dataframe(df[cols].tail(30),use_container_width=True,hide_index=True)
 
-        if mode in ("suicida","sniper"):
-            st.markdown("#### 🔥 Últimos Níveis")
-            for t in trades[-5:]:
-                ic  ="✅" if t["profit"]>0 else "❌"
-                col ="#00d4aa" if t["profit"]>0 else "#ff4d6d"
-                after=t["stake"]+t["profit"]
-                st.markdown(
-                    f'<div class="level-bar">'
-                    f'<span style="color:{col}">{ic} Nv{t.get("level","?")}</span> '
-                    f'${t["stake"]:.2f}→<b style="color:{col}">${after:.2f}</b> '
-                    f'{t["direction"]} {t["time"]}</div>',
-                    unsafe_allow_html=True)
+        st.markdown("#### 📈 Últimos Níveis (stake)")
+        for t in trades[-5:]:
+            ic  ="✅" if t["profit"]>0 else "❌"
+            col ="#00d4aa" if t["profit"]>0 else "#ff4d6d"
+            after=t["stake"]+t["profit"]
+            st.markdown(
+                f'<div class="level-bar">'
+                f'<span style="color:{col}">{ic} Nv{t.get("level","?")}</span> '
+                f'${t["stake"]:.2f}→<b style="color:{col}">${after:.2f}</b> '
+                f'{t["direction"]} {t["time"]}</div>',
+                unsafe_allow_html=True)
     else:
         st.info("🤖 Clica ▶ INICIAR — o bot opera sozinho.")
 
@@ -1056,7 +1019,6 @@ with right:
     for e in logs[-20:]:
         cor=("#00d4aa" if any(x in e for x in ["✅","META","🎯","WIN"])
              else "#ff4d6d" if any(x in e for x in ["❌","💥","🛑","LOSS"])
-             else "#ff6600" if any(x in e for x in ["🔥","SNIPER","⚡","disparar"])
              else "#f59e0b" if any(x in e for x in ["⏳","💸","📡"])
              else "#a0c0ff" if any(x in e for x in ["📝","📊","✅ Con"])
              else "#7c9cbf")
@@ -1094,8 +1056,7 @@ if start_btn:
         st.session_state.bot    =bot
         st.session_state.running=True
         threading.Thread(target=lambda:asyncio.run(bot.run()),daemon=True).start()
-        lbl="🎯 SNIPER SUICIDA" if is_sniper else "Bot"
-        st.success(f"✅ {lbl} iniciado! {sym_label} | Meta:+${goal:.2f}")
+        st.success(f"✅ Bot iniciado! {sym_label} | {MODOS[mode]['label']} | Meta:+${goal:.2f}")
         time.sleep(1); st.rerun()
 
 if stop_btn:
@@ -1106,5 +1067,5 @@ if stop_btn:
     time.sleep(1); st.rerun()
 
 if manager.is_running():
-    time.sleep(2 if is_sniper else 3)
+    time.sleep(3)
     st.rerun()
