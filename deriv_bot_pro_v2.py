@@ -1,9 +1,9 @@
 # =============================================================================
 #  SEVEN LEVELS BOT — MA7 + MACD + Compounding Automático
-#  Estratégia: Média Móvel 7 + MACD confirmação
-#  Modos: Conservador | Moderado | Compounding Suicida ($1→$1000)
-#  API: Nova Deriv API (PAT → REST → OTP → WebSocket)
-#  Bot 100% automático: começa, opera, para sozinho (meta ou perda)
+#  CORRIGIDO v2:
+#  - Meta baseada em P&L (ganho), NÃO no saldo total
+#  - Só índices sintéticos (único suporte da Deriv API para opções binárias)
+#  - Volatility Indices: R_10, R_25, R_50, R_75, R_100, 1HZ10V... 1HZ100V
 # =============================================================================
 
 import streamlit as st
@@ -22,30 +22,47 @@ import pandas as pd
 import websockets
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PARES DISPONÍVEIS
+#  ATIVOS SUPORTADOS (Opções Binárias na Deriv API)
 # ─────────────────────────────────────────────────────────────────────────────
 
-FOREX_PAIRS = [
-    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxUSDCHF",
-    "frxAUDUSD", "frxUSDCAD", "frxNZDUSD",
-    "frxEURGBP", "frxEURJPY", "frxGBPJPY", "frxAUDJPY",
-]
-
-COMMODITIES = [
-    "frxXAUUSD", "frxXAGUSD", "frxBROUSD",
-]
-
-SYMBOL_LABELS = {
-    "frxEURUSD": "EUR/USD", "frxGBPUSD": "GBP/USD",
-    "frxUSDJPY": "USD/JPY", "frxUSDCHF": "USD/CHF",
-    "frxAUDUSD": "AUD/USD", "frxUSDCAD": "USD/CAD",
-    "frxNZDUSD": "NZD/USD", "frxEURGBP": "EUR/GBP",
-    "frxEURJPY": "EUR/JPY", "frxGBPJPY": "GBP/JPY",
-    "frxAUDJPY": "AUD/JPY", "frxXAUUSD": "Ouro/USD 🥇",
-    "frxXAGUSD": "Prata/USD 🥈", "frxBROUSD": "Petróleo Brent 🛢️",
+VOLATILITY_SYMBOLS = {
+    # Volatility Indices (movimento contínuo 24/7)
+    "R_10":      "Volatility 10 Index",
+    "R_25":      "Volatility 25 Index",
+    "R_50":      "Volatility 50 Index",
+    "R_75":      "Volatility 75 Index",
+    "R_100":     "Volatility 100 Index",
+    # HZ — 1 tique por segundo
+    "1HZ10V":   "Volatility 10 (1s) Index",
+    "1HZ25V":   "Volatility 25 (1s) Index",
+    "1HZ50V":   "Volatility 50 (1s) Index",
+    "1HZ75V":   "Volatility 75 (1s) Index",
+    "1HZ100V":  "Volatility 100 (1s) Index",
+    # Crash & Boom
+    "CRASH300":  "Crash 300 Index",
+    "CRASH500":  "Crash 500 Index",
+    "CRASH1000": "Crash 1000 Index",
+    "BOOM300":   "Boom 300 Index",
+    "BOOM500":   "Boom 500 Index",
+    "BOOM1000":  "Boom 1000 Index",
+    # Step Index
+    "stpRNG":    "Step Index",
+    # Jump Indices
+    "JD10":      "Jump 10 Index",
+    "JD25":      "Jump 25 Index",
+    "JD50":      "Jump 50 Index",
+    "JD75":      "Jump 75 Index",
+    "JD100":     "Jump 100 Index",
 }
 
-ALL_SYMBOLS = FOREX_PAIRS + COMMODITIES
+# Grupos para o selectbox
+SYMBOL_GROUPS = {
+    "📊 Volatility (Recomendado)": ["R_10","R_25","R_50","R_75","R_100"],
+    "⚡ Volatility 1s":            ["1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"],
+    "💥 Crash & Boom":             ["CRASH300","CRASH500","CRASH1000","BOOM300","BOOM500","BOOM1000"],
+    "🪜 Step Index":               ["stpRNG"],
+    "🦘 Jump Indices":             ["JD10","JD25","JD50","JD75","JD100"],
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SECTION 1 — DATA STRUCTURES
@@ -75,7 +92,7 @@ class Candle:
 
 @dataclass
 class Signal:
-    direction:  str    # "CALL" | "PUT" | "WAIT"
+    direction:  str
     confidence: float
     reason:     str
     ma_score:   float = 0.0
@@ -95,7 +112,6 @@ def _ema(prices: list, period: int) -> list:
         out.append(p * k + out[-1] * (1 - k))
     return out
 
-
 def _sma(prices: list, period: int) -> list:
     out = []
     for i in range(len(prices)):
@@ -107,106 +123,53 @@ def _sma(prices: list, period: int) -> list:
 
 
 class MA7Indicator:
-    """
-    Média Móvel Simples de 7 períodos — a 'linha vermelha' da estratégia.
-    Regras:
-      - Preço ACIMA da MA7 = tendência de ALTA
-      - Preço ABAIXO da MA7 = tendência de BAIXA
-      - Entrada ideal: preço TOCA ou se APROXIMA da MA7
-    """
     PERIOD = 7
 
     def analyze(self, closes: list) -> dict:
         if len(closes) < self.PERIOD + 2:
-            return {"trend": "SIDEWAYS", "touch": False, "distance_pct": 1.0, "ma": None}
-
-        ma  = _sma(closes, self.PERIOD)
+            return {"trend":"SIDEWAYS","touch":False,"near":False,
+                    "distance":1.0,"score":0.0,"ma":None}
+        ma      = _sma(closes, self.PERIOD)
         ma_now  = ma[-1]
         price   = closes[-1]
-        dist    = abs(price - ma_now) / ma_now   # distância em %
-
-        # Tendência pela posição do preço em relação à MA
-        if price > ma_now:
-            trend = "UP"
-        elif price < ma_now:
-            trend = "DOWN"
-        else:
-            trend = "SIDEWAYS"
-
-        # "Toque" = preço dentro de 0.15% da MA (zona de entrada ideal)
-        touch = dist < 0.0015
-
-        # "Aproximação" = preço dentro de 0.35% da MA (zona de entrada boa)
-        near  = dist < 0.0035
-
-        # Score: quanto mais perto da MA, maior a pontuação
-        score = max(0.0, 1.0 - dist / 0.004)
-
-        return {
-            "trend":    trend,
-            "touch":    touch,
-            "near":     near,
-            "distance": dist,
-            "score":    round(score, 2),
-            "ma":       ma_now,
-            "ma_list":  ma,
-        }
+        dist    = abs(price - ma_now) / (ma_now + 1e-9)
+        trend   = "UP" if price > ma_now else ("DOWN" if price < ma_now else "SIDEWAYS")
+        touch   = dist < 0.0015
+        near    = dist < 0.0035
+        score   = max(0.0, 1.0 - dist / 0.004)
+        return {"trend":trend,"touch":touch,"near":near,
+                "distance":dist,"score":round(score,2),"ma":ma_now}
 
 
 class MACDIndicator:
-    """
-    MACD padrão: EMA12 - EMA26, Signal = EMA9 do MACD
-    Regras:
-      - MACD > Signal E crescendo = confirmação ALTA
-      - MACD < Signal E descendo  = confirmação BAIXA
-      - Histograma crescente/decrescente indica força
-    """
-    FAST   = 12
-    SLOW   = 26
-    SIGNAL = 9
+    FAST=12; SLOW=26; SIGNAL=9
 
     def analyze(self, closes: list) -> dict:
         if len(closes) < self.SLOW + self.SIGNAL + 2:
-            return {"direction": "NEUTRAL", "score": 0.0, "histogram": 0.0}
-
-        ema_fast = _ema(closes, self.FAST)
-        ema_slow = _ema(closes, self.SLOW)
-
-        macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+            return {"direction":"NEUTRAL","score":0.0,"growing":False}
+        ema_fast    = _ema(closes, self.FAST)
+        ema_slow    = _ema(closes, self.SLOW)
+        macd_line   = [f - s for f,s in zip(ema_fast, ema_slow)]
         signal_line = _ema(macd_line, self.SIGNAL)
-        histogram   = [m - s for m, s in zip(macd_line, signal_line)]
+        histogram   = [m - s for m,s in zip(macd_line, signal_line)]
+        macd_now    = macd_line[-1]
+        sig_now     = signal_line[-1]
+        hist_now    = histogram[-1]
+        hist_prev   = histogram[-2] if len(histogram)>1 else 0
 
-        macd_now  = macd_line[-1]
-        sig_now   = signal_line[-1]
-        hist_now  = histogram[-1]
-        hist_prev = histogram[-2] if len(histogram) > 1 else 0
-
-        # Direção e força
         if macd_now > sig_now and hist_now > 0:
             direction = "BULL"
-            # Histograma a crescer = confirmação mais forte
-            strength  = min(1.0, abs(hist_now) / (abs(macd_now) + 1e-9) * 5)
+            strength  = min(1.0, abs(hist_now)/(abs(macd_now)+1e-9)*5)
             growing   = hist_now > hist_prev
         elif macd_now < sig_now and hist_now < 0:
             direction = "BEAR"
-            strength  = min(1.0, abs(hist_now) / (abs(macd_now) + 1e-9) * 5)
+            strength  = min(1.0, abs(hist_now)/(abs(macd_now)+1e-9)*5)
             growing   = hist_now < hist_prev
         else:
-            direction = "NEUTRAL"
-            strength  = 0.0
-            growing   = False
+            direction = "NEUTRAL"; strength = 0.0; growing = False
 
-        score = round(strength * (1.2 if growing else 0.8), 2)
-        score = min(1.0, score)
-
-        return {
-            "direction": direction,
-            "score":     score,
-            "histogram": hist_now,
-            "growing":   growing,
-            "macd":      macd_now,
-            "signal":    sig_now,
-        }
+        score = min(1.0, round(strength * (1.2 if growing else 0.8), 2))
+        return {"direction":direction,"score":score,"growing":growing}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,105 +177,59 @@ class MACDIndicator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SevenLevelsEngine:
-    """
-    Implementação fiel da estratégia do vídeo:
+    def __init__(self, mode="conservador"):
+        self.mode     = mode
+        self.ma7      = MA7Indicator()
+        self.macd     = MACDIndicator()
+        self.min_conf = {"conservador":0.72,"moderado":0.60,"suicida":0.50}.get(mode,0.72)
 
-    ENTRADA IDEAL (score máximo):
-      → Preço TOCA a MA7
-      → MACD confirma na mesma direção
-      → Entrar dentro dos primeiros 30s da vela
-
-    ENTRADA DE FLUXO (score médio):
-      → Preço NÃO tocou a MA7 mas está perto
-      → MACD forte + histograma crescente na mesma direção
-      → Velas anteriores confirmam tendência
-
-    BLOQUEIO:
-      → MACD contra a direção da MA7
-      → Mercado lateral (preço cruzando MA repetidamente)
-      → Confiança abaixo do mínimo configurado
-    """
-    MIN_CONF_CONSERVATIVE = 0.75
-    MIN_CONF_MODERATE     = 0.60
-    MIN_CONF_SUICIDE      = 0.50   # suicida aceita entradas com menos confirmação
-
-    def __init__(self, mode: str = "conservador"):
-        self.mode = mode
-        self.ma7  = MA7Indicator()
-        self.macd = MACDIndicator()
-        self.min_conf = {
-            "conservador": self.MIN_CONF_CONSERVATIVE,
-            "moderado":    self.MIN_CONF_MODERATE,
-            "suicida":     self.MIN_CONF_SUICIDE,
-        }.get(mode, self.MIN_CONF_CONSERVATIVE)
-
-    def _count_consecutive(self, candles: list, bullish: bool) -> int:
+    def _consec(self, candles, bullish):
         count = 0
         for c in reversed(candles[:-1]):
             if (bullish and c.is_bullish) or (not bullish and c.is_bearish):
                 count += 1
-            else:
-                break
+            else: break
         return count
 
     def evaluate(self, candles: list) -> Signal:
         if len(candles) < 35:
-            return Signal("WAIT", 0.0, "aguardando candles suficientes...")
+            return Signal("WAIT", 0.0, "aguardando candles...")
 
-        closes = [c.close for c in candles]
+        closes      = [c.close for c in candles]
+        ma_r        = self.ma7.analyze(closes)
+        macd_r      = self.macd.analyze(closes)
+        trend       = ma_r["trend"]
+        macd_dir    = macd_r["direction"]
+        macd_grow   = macd_r["growing"]
 
-        # ── Indicadores ───────────────────────────────────────────────────────
-        ma_result   = self.ma7.analyze(closes)
-        macd_result = self.macd.analyze(closes)
-
-        trend    = ma_result["trend"]
-        ma_score = ma_result["score"]
-        ma_now   = ma_result["ma"]
-        price    = closes[-1]
-
-        macd_dir   = macd_result["direction"]
-        macd_score = macd_result["score"]
-        macd_grow  = macd_result["growing"]
-
-        # ── Lateral — não operar ──────────────────────────────────────────────
         if trend == "SIDEWAYS":
             return Signal("WAIT", 0.0, "MA7: mercado lateral")
 
-        # ── Direção base pela MA7 ─────────────────────────────────────────────
         base_dir    = "CALL" if trend == "UP" else "PUT"
         macd_expect = "BULL" if base_dir == "CALL" else "BEAR"
 
-        # ── MACD contra a MA7 — bloquear ──────────────────────────────────────
         if macd_dir not in ("NEUTRAL", macd_expect):
             return Signal("WAIT", 0.0,
-                          f"MACD contra MA7: MA={trend} MACD={macd_dir} — bloqueado")
+                f"MACD contra MA7 ({macd_dir} vs {macd_expect}) — bloqueado")
 
-        # ── Contar velas consecutivas na direção ──────────────────────────────
-        consec = self._count_consecutive(candles, base_dir == "CALL")
-
-        # ── Calcular confiança ────────────────────────────────────────────────
-        touch_bonus = 0.25 if ma_result["touch"] else (0.10 if ma_result["near"] else 0.0)
-        macd_bonus  = macd_score * 0.35
+        consec      = self._consec(candles, base_dir == "CALL")
+        touch_bonus = 0.25 if ma_r["touch"] else (0.10 if ma_r["near"] else 0.0)
+        macd_bonus  = macd_r["score"] * 0.35
         consec_bon  = min(0.20, consec * 0.05)
         grow_bonus  = 0.10 if macd_grow else 0.0
+        conf        = round(min(1.0, 0.30 + touch_bonus + macd_bonus + consec_bon + grow_bonus), 2)
 
-        conf = round(min(1.0, 0.30 + touch_bonus + macd_bonus + consec_bon + grow_bonus), 2)
-
-        # ── Verificar confiança mínima ────────────────────────────────────────
         if conf < self.min_conf:
-            touch_str = "TOQUE ✅" if ma_result["touch"] else (
-                        "perto" if ma_result["near"] else f"longe ({ma_result['distance']*100:.2f}%)")
             return Signal("WAIT", conf,
-                          f"conf baixa ({conf:.2f}<{self.min_conf}) | MA:{touch_str} | MACD:{macd_dir}({macd_score:.2f})")
+                f"conf {conf:.2f} < {self.min_conf} | MA:{ma_r['distance']*100:.2f}% | MACD:{macd_dir}")
 
-        # ── Construir razão detalhada ─────────────────────────────────────────
-        touch_str = "TOQUE NA MA7 ✅" if ma_result["touch"] else (
-                    f"perto MA7 ({ma_result['distance']*100:.2f}%)" if ma_result["near"]
-                    else f"fluxo forte ({ma_result['distance']*100:.2f}% da MA7)")
-        reason = (f"7L {base_dir} | {touch_str} | MACD:{macd_dir}({macd_score:.2f})"
-                  f"{' 📈grow' if macd_grow else ''} | velas:{consec} | conf:{conf:.2f}")
+        touch_str = ("TOQUE MA7✅" if ma_r["touch"]
+                     else f"perto MA7({ma_r['distance']*100:.2f}%)" if ma_r["near"]
+                     else f"fluxo({ma_r['distance']*100:.2f}%)")
+        reason = (f"{base_dir} | {touch_str} | MACD:{macd_dir}({macd_r['score']:.2f})"
+                  f"{'📈' if macd_grow else ''} | velas:{consec} | conf:{conf:.2f}")
 
-        return Signal(base_dir, conf, reason, ma_score, macd_score)
+        return Signal(base_dir, conf, reason, ma_r["score"], macd_r["score"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,66 +237,34 @@ class SevenLevelsEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CompoundingManager:
-    """
-    Gere os 3 modos de apostas:
+    def __init__(self, mode, base_stake, goal, payout_pct=0.85):
+        self.mode       = mode
+        self.base_stake = base_stake
+        self.goal       = goal
+        self.payout     = payout_pct
+        self.current    = base_stake
+        self.level      = 1
+        self.peak       = base_stake
 
-    CONSERVADOR: aposta fixa, sem compounding
-    MODERADO:    aposta cresce 20% por win, reset em loss
-    SUICIDA:     reinveste TUDO a cada trade (fiel ao vídeo)
-                 $1 → $2 → $4 → $8 → ... → $1000
-    """
+    def next_stake(self): return round(self.current, 2)
 
-    def __init__(self, mode: str, base_stake: float, goal: float, payout_pct: float = 0.85):
-        self.mode        = mode
-        self.base_stake  = base_stake
-        self.goal        = goal
-        self.payout      = payout_pct   # % de retorno da Deriv (tipicamente 80-95%)
-        self.current     = base_stake
-        self.level       = 1
-        self.peak        = base_stake
-        self.history     = []           # histórico dos níveis
-
-    def next_stake(self) -> float:
-        return round(self.current, 2)
-
-    def on_win(self, profit: float):
-        self.history.append({"level": self.level, "stake": self.current,
-                             "result": "WIN", "profit": profit})
+    def on_win(self, profit):
         if self.mode == "suicida":
-            # Reinveste tudo: capital + lucro
             self.current = round(self.current + profit, 2)
-            self.level  += 1
             self.peak    = max(self.peak, self.current)
         elif self.mode == "moderado":
-            # Cresce 20% por win
             self.current = round(min(self.current * 1.20, self.goal * 0.5), 2)
-            self.level  += 1
-        else:
-            # Conservador: aposta fixa
-            self.current = self.base_stake
-
-    def on_loss(self, loss: float):
-        self.history.append({"level": self.level, "stake": self.current,
-                             "result": "LOSS", "profit": -abs(loss)})
-        if self.mode == "suicida":
-            # Perde tudo — reinicia do zero
-            self.current = self.base_stake
-            self.level   = 1
-        elif self.mode == "moderado":
-            # Reset para base
-            self.current = self.base_stake
-            self.level   = 1
         else:
             self.current = self.base_stake
+        self.level += 1
 
-    def progress_pct(self, current_balance: float) -> float:
-        if self.goal <= self.base_stake: return 0.0
-        return min(100.0, (current_balance - self.base_stake) / (self.goal - self.base_stake) * 100)
+    def on_loss(self, loss):
+        self.current = self.base_stake
+        self.level   = 1
 
-    def levels_info(self) -> str:
-        if self.mode == "suicida":
-            return f"Nível {self.level} | Próxima aposta: ${self.current:.2f} | Pico: ${self.peak:.2f}"
-        return f"Aposta atual: ${self.current:.2f}"
+    def reset(self):
+        self.current = self.base_stake
+        self.level   = 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +277,7 @@ class SessionManager:
         self._trades        = []
         self._logs          = deque(maxlen=300)
         self._signals       = deque(maxlen=50)
-        self._pnl           = 0.0
+        self._pnl           = 0.0   # P&L acumulado (ganho/perda)
         self._wins          = 0
         self._losses        = 0
         self._consec_losses = 0
@@ -400,7 +285,7 @@ class SessionManager:
         self._running       = False
         self._stop_reason   = ""
 
-    def set_running(self, v: bool, reason: str = ""):
+    def set_running(self, v, reason=""):
         with self._lock:
             self._running     = v
             self._stop_reason = reason
@@ -415,7 +300,7 @@ class SessionManager:
         with self._lock:
             entry = {
                 "time":      datetime.now().strftime("%H:%M:%S"),
-                "symbol":    SYMBOL_LABELS.get(symbol, symbol),
+                "symbol":    VOLATILITY_SYMBOLS.get(symbol, symbol),
                 "direction": direction,
                 "level":     level,
                 "stake":     round(stake, 2),
@@ -433,8 +318,8 @@ class SessionManager:
                 self._max_consec    = max(self._max_consec, self._consec_losses)
             r = f"✅ +${profit:.2f}" if profit > 0 else f"❌ -${abs(profit):.2f}"
             self._logs.append(
-                f"[{entry['time']}] Nv{level} {direction} {entry['symbol']} "
-                f"stake=${stake:.2f} {r}")
+                f"[{entry['time']}] Nv{level} {direction} "
+                f"{entry['symbol']} ${stake:.2f} {r}")
 
     def add_signal(self, direction, reason):
         with self._lock:
@@ -456,19 +341,21 @@ class SessionManager:
         with self._lock: return list(self._logs)
     def consec_losses(self):
         with self._lock: return self._consec_losses
+    def pnl(self):
+        with self._lock: return self._pnl
 
     def stats(self):
         with self._lock:
             total   = self._wins + self._losses
             winrate = (self._wins / total * 100) if total > 0 else 0.0
             return {
-                "pnl":          round(self._pnl, 2),
-                "trades":       total,
-                "wins":         self._wins,
-                "losses":       self._losses,
-                "winrate":      winrate,
+                "pnl":           round(self._pnl, 2),
+                "trades":        total,
+                "wins":          self._wins,
+                "losses":        self._losses,
+                "winrate":       winrate,
                 "consec_losses": self._consec_losses,
-                "max_consec":   self._max_consec,
+                "max_consec":    self._max_consec,
             }
 
     def reset(self):
@@ -536,7 +423,7 @@ class DerivClient:
                 body = await resp.json()
                 if resp.status != 200:
                     raise PermissionError(f"Erro OTP: {body}")
-                ws_url = body.get("data", {}).get("url")
+                ws_url = body.get("data",{}).get("url")
                 if not ws_url:
                     raise RuntimeError(f"URL WS não encontrado: {body}")
                 return ws_url
@@ -641,111 +528,105 @@ class DerivClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SECTION 7 — BOT PRINCIPAL (100% automático)
+#  SECTION 7 — BOT PRINCIPAL
+#  Meta e Stop baseados em P&L (ganho/perda desde o início da sessão)
+#  NÃO no saldo total da conta
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DURATION_MAP = {
-    "1m":  (1,"m"),  "5m":  (5,"m"),
-    "15m": (15,"m"), "30m": (30,"m"),
-    "1h":  (1,"h"),
+    "1m":(1,"m"), "5m":(5,"m"), "15m":(15,"m"),
+    "30m":(30,"m"), "1h":(1,"h"),
 }
 _GRANULARITY_MAP = {
-    "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
+    "1m":60, "5m":300, "15m":900, "30m":1800, "1h":3600,
 }
 
 
 class SevenLevelsBot:
-    """
-    Bot 100% automático.
-    Começa quando clicas ▶ Iniciar.
-    Para sozinho quando:
-      - Atinge a meta (goal)
-      - Perde o stop loss
-      - Atinge N perdas consecutivas
-      - Modo suicida: reinicia do base_stake após loss e continua
-    """
-
-    def __init__(self, config: dict, manager: SessionManager):
+    def __init__(self, config, manager):
         self.cfg        = config
         self.manager    = manager
         self._stop      = False
 
-        # Configurações
         self.symbol     = config["symbol"]
-        self.mode       = config["mode"]          # conservador | moderado | suicida
+        self.mode       = config["mode"]
         self.dur        = config["duration"]
         self.dur_val, self.dur_unit = _DURATION_MAP.get(self.dur, (5,"m"))
         self.granularity = _GRANULARITY_MAP.get(self.dur, 300)
 
-        # Capital
+        # ── Capital — tudo baseado em P&L, não no saldo ──────────────────────
         self.base_stake  = float(config["stake"])
-        self.goal        = float(config["goal"])
-        self.stop_loss   = float(config["stop_loss"])
+        self.goal_pnl    = float(config["goal"])      # ganhar ESTE valor
+        self.stop_pnl    = float(config["stop_loss"]) # perder no máximo ESTE valor
         self.max_consec  = int(config["max_consec"])
 
-        # Engine e compounding
         self.engine   = SevenLevelsEngine(mode=self.mode)
         self.compound = CompoundingManager(
             mode=self.mode,
             base_stake=self.base_stake,
-            goal=self.goal)
+            goal=self.goal_pnl)
 
         self.client   = DerivClient(
             config["api_token"], config["app_id"],
             config.get("account_type","demo"))
 
-        self.candles      = []
-        self.total_pnl    = 0.0
-        self.start_balance = 0.0
+        self.candles  = []
 
     def stop(self): self._stop = True
 
     async def run(self):
-        label = SYMBOL_LABELS.get(self.symbol, self.symbol)
+        label = VOLATILITY_SYMBOLS.get(self.symbol, self.symbol)
         self.manager.set_running(True)
         self.manager.log(f"🚀 Seven Levels Bot INICIADO")
         self.manager.log(f"📌 {label} | Modo: {self.mode.upper()} | TF: {self.dur}")
-        self.manager.log(f"💰 Stake inicial: ${self.base_stake} | Meta: ${self.goal} | Stop: ${self.stop_loss}")
+        self.manager.log(
+            f"💰 Stake: ${self.base_stake} | "
+            f"Meta P&L: +${self.goal_pnl} | "
+            f"Stop P&L: -${self.stop_pnl}")
+        self.manager.log(
+            f"ℹ️ Bot para quando GANHAR ${self.goal_pnl} "
+            f"OU PERDER ${self.stop_pnl} desde o início")
 
         try:
             await self.client.connect()
-            self.start_balance = await self.client.get_balance()
+            balance = await self.client.get_balance()
             self.manager.log(
                 f"✅ Conectado | {self.client._account_id} | "
-                f"Saldo: ${self.start_balance:.2f}")
+                f"Saldo conta: ${balance:.2f}")
 
-            # Carregar candles históricos
             raw = await self.client.subscribe_candles(self.symbol, self.granularity)
             for r in raw:
                 self.candles.append(Candle(
                     float(r["open"]), float(r["high"]),
                     float(r["low"]),  float(r["close"]),
-                    int(r.get("epoch", 0))))
+                    int(r.get("epoch",0))))
             self.candles = self.candles[-150:]
-            self.manager.log(f"📊 {len(self.candles)} candles carregados")
-            self.manager.log(f"👁️ A monitorizar... aguardando sinal MA7+MACD")
+            self.manager.log(f"📊 {len(self.candles)} candles carregados | aguardando sinal MA7+MACD...")
 
-            # ── Loop principal ─────────────────────────────────────────────────
             while not self._stop:
-                stats = self.manager.stats()
+                # ── P&L da sessão actual ───────────────────────────────────────
+                session_pnl = self.manager.pnl()
+                stats       = self.manager.stats()
 
-                # ── Verificar condições de paragem ─────────────────────────────
-                current_balance = self.start_balance + self.total_pnl
-
-                if current_balance >= self.goal:
-                    reason = f"🎯 META ATINGIDA! Saldo: ${current_balance:.2f} / Meta: ${self.goal:.2f}"
+                # ── Verificar META (ganhou o suficiente) ───────────────────────
+                if session_pnl >= self.goal_pnl:
+                    reason = (f"🎯 META ATINGIDA! "
+                              f"Ganho: +${session_pnl:.2f} / Meta: +${self.goal_pnl:.2f}")
                     self.manager.log(reason)
                     self.manager.set_running(False, reason)
                     break
 
-                if self.total_pnl <= -self.stop_loss:
-                    reason = f"🛑 STOP LOSS! Perda: ${abs(self.total_pnl):.2f} / Limite: ${self.stop_loss:.2f}"
+                # ── Verificar STOP LOSS (perdeu demais) ────────────────────────
+                if session_pnl <= -self.stop_pnl:
+                    reason = (f"🛑 STOP LOSS! "
+                              f"Perda: -${abs(session_pnl):.2f} / Limite: -${self.stop_pnl:.2f}")
                     self.manager.log(reason)
                     self.manager.set_running(False, reason)
                     break
 
+                # ── Perdas consecutivas (só não-suicida) ───────────────────────
                 if stats["consec_losses"] >= self.max_consec and self.mode != "suicida":
-                    reason = f"🛑 {stats['consec_losses']} PERDAS CONSECUTIVAS — Bot parado!"
+                    reason = f"🛑 {stats['consec_losses']} perdas consecutivas — parado!"
                     self.manager.log(reason)
                     self.manager.set_running(False, reason)
                     break
@@ -758,7 +639,7 @@ class SevenLevelsBot:
                         c = Candle(
                             float(ohlc["open"]), float(ohlc["high"]),
                             float(ohlc["low"]),  float(ohlc["close"]),
-                            int(ohlc.get("epoch", 0)))
+                            int(ohlc.get("epoch",0)))
                         if not self.candles or c.epoch != self.candles[-1].epoch:
                             self.candles.append(c)
                             if len(self.candles) > 150:
@@ -777,14 +658,15 @@ class SevenLevelsBot:
                 if signal.direction == "WAIT":
                     continue
 
-                # ── Log do sinal ───────────────────────────────────────────────
                 stake = self.compound.next_stake()
+
                 self.manager.log(
-                    f"📡 SINAL {signal.direction} | conf={signal.confidence:.2f} "
-                    f"| MA={signal.ma_score:.2f} | MACD={signal.macd_score:.2f}")
-                self.manager.log(f"   {signal.reason}")
+                    f"📡 SINAL {signal.direction} | "
+                    f"conf={signal.confidence:.2f} | {signal.reason[:70]}")
                 self.manager.log(
-                    f"💸 Nível {self.compound.level} | Apostando ${stake:.2f}")
+                    f"💸 Nível {self.compound.level} | "
+                    f"Apostando ${stake:.2f} | "
+                    f"P&L sessão: ${session_pnl:+.2f}")
 
                 # ── Executar trade ─────────────────────────────────────────────
                 try:
@@ -792,11 +674,10 @@ class SevenLevelsBot:
                         self.symbol, signal.direction,
                         stake, self.dur_val, self.dur_unit)
                     contract_id = buy_info.get("contract_id")
-                    self.manager.log(f"📝 Contrato #{contract_id} aberto")
+                    self.manager.log(f"📝 Contrato #{contract_id} aberto — aguardando resultado...")
 
-                    result = await self.client.get_contract_result(contract_id)
-                    profit = result["profit"]
-                    self.total_pnl += profit
+                    result      = await self.client.get_contract_result(contract_id)
+                    profit      = result["profit"]
 
                     self.manager.add_trade(
                         self.symbol, signal.direction,
@@ -804,27 +685,31 @@ class SevenLevelsBot:
                         self.compound.level,
                         signal.reason[:60])
 
+                    new_pnl = self.manager.pnl()
+
                     if profit > 0:
                         self.compound.on_win(profit)
-                        new_balance = self.start_balance + self.total_pnl
                         self.manager.log(
-                            f"✅ WIN +${profit:.2f} | Saldo: ${new_balance:.2f} "
-                            f"| Próx aposta: ${self.compound.current:.2f}")
-                        # Modo suicida: mostra progresso
+                            f"✅ WIN +${profit:.2f} | "
+                            f"P&L sessão: ${new_pnl:+.2f} | "
+                            f"Próx: ${self.compound.current:.2f}")
                         if self.mode == "suicida":
                             self.manager.log(
                                 f"🔥 Nível {self.compound.level} | "
-                                f"Acumulado: ${self.compound.current:.2f} / Meta: ${self.goal:.2f}")
+                                f"Acumulado suicida: ${self.compound.current:.2f} "
+                                f"→ Meta: ${self.goal_pnl:.2f}")
                     else:
                         self.compound.on_loss(abs(profit))
-                        new_balance = self.start_balance + self.total_pnl
                         self.manager.log(
-                            f"❌ LOSS -${abs(profit):.2f} | Saldo: ${new_balance:.2f}")
+                            f"❌ LOSS -${abs(profit):.2f} | "
+                            f"P&L sessão: ${new_pnl:+.2f}")
                         if self.mode == "suicida":
                             self.manager.log(
-                                f"💀 Suicida: perdeu tudo! Reiniciando com ${self.base_stake:.2f}")
+                                f"💀 Suicida reinicia: "
+                                f"${self.base_stake:.2f} | "
+                                f"Nível volta a 1")
 
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
 
                 except Exception as e:
                     self.manager.log(f"❌ Erro no trade: {e}")
@@ -835,12 +720,12 @@ class SevenLevelsBot:
             self.manager.set_running(False, f"Erro: {e}")
         finally:
             await self.client.disconnect()
-            final_balance = self.start_balance + self.total_pnl
+            final_pnl = self.manager.pnl()
             self.manager.log(
-                f"🔌 Bot encerrado | P&L total: ${self.total_pnl:.2f} "
-                f"| Saldo final: ${final_balance:.2f}")
+                f"🔌 Bot encerrado | "
+                f"P&L sessão: ${final_pnl:+.2f}")
             if self.manager.is_running():
-                self.manager.set_running(False, "Bot encerrado")
+                self.manager.set_running(False, "Encerrado")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -862,35 +747,30 @@ html,body,[class*="css"]{ font-family:'Space Grotesk',sans-serif; }
 .loss   { color:#ff4d6d; font-family:'JetBrains Mono',monospace; font-size:1.6rem; font-weight:700; }
 .neutral{ color:#7c9cbf; font-family:'JetBrains Mono',monospace; font-size:1.6rem; font-weight:700; }
 .warn   { color:#f59e0b; font-family:'JetBrains Mono',monospace; font-size:1.6rem; font-weight:700; }
-.mode-card{ border-radius:10px; padding:14px 18px; margin:6px 0; cursor:pointer; }
-.mode-conservador{ background:#0d2818; border:2px solid #00d4aa; }
-.mode-moderado   { background:#1a1a0d; border:2px solid #f59e0b; }
-.mode-suicida    { background:#200a0a; border:2px solid #ff4d6d; }
 .signal-box { background:#111827; border-left:4px solid #00d4aa; border-radius:8px; padding:10px 14px; margin:4px 0; font-family:'JetBrains Mono',monospace; font-size:.80rem; }
 .signal-sell{ border-left-color:#ff4d6d; }
 .signal-wait{ border-left-color:#f59e0b; }
-.level-bar  { background:#111827; border:1px solid #1e3a5f; border-radius:8px; padding:12px; margin:4px 0; }
+.level-bar  { background:#111827; border:1px solid #1e3a5f; border-radius:8px; padding:10px; margin:3px 0; }
+.banner-running{ background:linear-gradient(135deg,#003320,#001a10); border:1px solid #00d4aa; border-radius:10px; padding:14px 20px; margin:8px 0; }
+.banner-stopped{ background:linear-gradient(135deg,#200a0a,#100505); border:1px solid #ff4d6d; border-radius:10px; padding:14px 20px; margin:8px 0; }
+.banner-goal   { background:linear-gradient(135deg,#1a3300,#0d1a00); border:2px solid #00ff88; border-radius:10px; padding:18px; margin:8px 0; text-align:center; font-size:1.2rem; }
 .dot-green{ width:10px;height:10px;background:#00d4aa;border-radius:50%;display:inline-block;margin-right:6px; }
 .dot-red  { width:10px;height:10px;background:#ff4d6d;border-radius:50%;display:inline-block;margin-right:6px; }
-.dot-yellow{width:10px;height:10px;background:#f59e0b;border-radius:50%;display:inline-block;margin-right:6px; }
 .stButton>button{ background:linear-gradient(135deg,#00d4aa,#0099ff); color:#0a0e1a; font-weight:700; border:none; border-radius:8px; font-size:1rem; padding:10px; }
-.stop-btn>button{ background:linear-gradient(135deg,#ff4d6d,#c0392b) !important; }
-.banner-running{ background:linear-gradient(135deg,#003320,#001a10); border:1px solid #00d4aa; border-radius:10px; padding:14px 20px; margin:10px 0; }
-.banner-stopped{ background:linear-gradient(135deg,#200a0a,#100505); border:1px solid #ff4d6d; border-radius:10px; padding:14px 20px; margin:10px 0; }
-.banner-goal   { background:linear-gradient(135deg,#1a3300,#0d1a00); border:1px solid #00ff88; border-radius:10px; padding:14px 20px; margin:10px 0; text-align:center; }
+.mode-info{ border-radius:8px; padding:10px 14px; margin:6px 0; font-size:.82rem; }
+.mode-c{ background:#0d2818; border-left:3px solid #00d4aa; color:#a0d8c0; }
+.mode-m{ background:#1a1a0d; border-left:3px solid #f59e0b; color:#d8c8a0; }
+.mode-s{ background:#200a0a; border-left:3px solid #ff4d6d; color:#d8a0a0; }
 </style>
 """, unsafe_allow_html=True)
 
-# Session state
-for k, v in [("bot", None), ("running", False), ("manager", SessionManager()),
-              ("mode", "conservador"), ("compound_mgr", None)]:
-    if k not in st.session_state:
-        st.session_state[k] = v
+for k,v in [("bot",None),("running",False),("manager",SessionManager())]:
+    if k not in st.session_state: st.session_state[k] = v
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎯 Seven Levels Bot")
-    st.markdown("*MA7 + MACD — Automático*")
+    st.markdown("*MA7 + MACD — 100% Automático*")
     st.markdown("---")
 
     api_key = st.text_input("🔑 PAT Token", type="password",
@@ -899,99 +779,99 @@ with st.sidebar:
                              value=os.environ.get("DERIV_APP_ID",""))
 
     st.markdown("---")
-    st.markdown("### 🌍 Mercado")
+    st.markdown("### 📊 Ativo")
     account_type = st.selectbox("Conta", ["demo","real"])
 
-    cat = st.radio("Categoria", ["Forex", "Commodities"])
-    syms = FOREX_PAIRS if cat == "Forex" else COMMODITIES
-    symbol = st.selectbox("Par", syms,
-                           format_func=lambda x: SYMBOL_LABELS.get(x, x))
+    group = st.selectbox("Grupo", list(SYMBOL_GROUPS.keys()))
+    symbol = st.selectbox("Índice",
+                           SYMBOL_GROUPS[group],
+                           format_func=lambda x: f"{x} — {VOLATILITY_SYMBOLS.get(x,x)}")
 
-    duration = st.selectbox("Timeframe", ["1m","5m","15m","30m","1h"],
-                             index=1,
-                             help="1m = mais trades, mais risco | 15m = mais fiável")
+    duration = st.selectbox("Timeframe",
+                             ["1m","5m","15m","30m","1h"],
+                             index=1)
 
     st.markdown("---")
-    st.markdown("### 🎮 Modo de Operação")
-
-    mode = st.radio("", ["conservador","moderado","suicida"],
+    st.markdown("### 🎮 Modo")
+    mode = st.radio("",
+                    ["conservador","moderado","suicida"],
                     format_func=lambda x: {
-                        "conservador": "🟢 Conservador — Aposta fixa",
-                        "moderado":    "🟡 Moderado — Cresce 20% por win",
-                        "suicida":     "🔴 Suicida — Reinveste tudo ($1→$1000)",
+                        "conservador": "🟢 Conservador",
+                        "moderado":    "🟡 Moderado",
+                        "suicida":     "🔴 Suicida ($1→$1000)",
                     }[x])
 
-    if mode == "conservador":
-        st.markdown('<div class="mode-card mode-conservador">Aposta fixa em todos os trades. Para após N perdas consecutivas. Mais seguro.</div>', unsafe_allow_html=True)
-    elif mode == "moderado":
-        st.markdown('<div class="mode-card mode-moderado">Aposta cresce 20% em cada win. Reset em loss. Risco médio.</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="mode-card mode-suicida">⚠️ Reinveste TODO o capital a cada trade. Uma única perda reinicia do início. Exactamente como no vídeo. ALTO RISCO.</div>', unsafe_allow_html=True)
+    mode_desc = {
+        "conservador": ("mode-c", "Aposta fixa. Para após N perdas seguidas. Mais seguro."),
+        "moderado":    ("mode-m", "Cresce 20% por win. Reset em loss."),
+        "suicida":     ("mode-s", "⚠️ Reinveste TUDO. Uma perda reinicia do zero. Exactamente como no vídeo."),
+    }
+    mc, md = mode_desc[mode]
+    st.markdown(f'<div class="mode-info {mc}">{md}</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### 💰 Capital")
+    stake = st.number_input(
+        "Aposta inicial ($)",
+        min_value=0.35, max_value=100.0 if mode!="suicida" else 10.0,
+        value=1.0, step=0.35)
 
-    if mode == "suicida":
-        stake     = st.number_input("Aposta inicial ($)", min_value=0.35, max_value=10.0,
-                                     value=1.0, step=0.35,
-                                     help="Começa aqui — reinveste tudo até à meta")
-        goal      = st.number_input("Meta ($)", min_value=10.0, max_value=10000.0,
-                                     value=1000.0, step=50.0)
-        stop_loss = st.number_input("Stop loss ($)", min_value=0.35, max_value=100.0,
-                                     value=stake, step=0.35,
-                                     help="No suicida = valor inicial perdido se falhar")
-        max_consec = 999  # suicida nunca para por consecutivas — reinicia e tenta de novo
-    else:
-        stake      = st.number_input("Aposta ($)", min_value=0.35, max_value=500.0,
-                                      value=1.0, step=0.5)
-        goal       = st.number_input("Meta ($)", min_value=1.0, max_value=10000.0,
-                                      value=10.0, step=1.0)
-        stop_loss  = st.number_input("Stop loss ($)", min_value=0.35, max_value=1000.0,
-                                      value=5.0, step=0.5)
-        max_consec = st.number_input("Stop por perdas consecutivas",
-                                      min_value=1, max_value=10, value=3)
+    goal = st.number_input(
+        "Meta de GANHO ($)" if mode != "suicida" else "Meta suicida ($)",
+        min_value=0.5, max_value=10000.0,
+        value=1000.0 if mode=="suicida" else 10.0,
+        step=1.0,
+        help="Bot para quando GANHAR este valor desde o início da sessão")
+
+    stop_loss = st.number_input(
+        "Stop Loss ($)",
+        min_value=0.35, max_value=1000.0,
+        value=stake if mode=="suicida" else 5.0,
+        step=0.35,
+        help="Bot para quando PERDER este valor desde o início da sessão")
+
+    max_consec = 999 if mode=="suicida" else int(
+        st.number_input("Parar após N perdas seguidas",
+                        min_value=1, max_value=10, value=3))
 
     st.markdown("---")
     c1, c2 = st.columns(2)
     start_btn = c1.button("▶ INICIAR", use_container_width=True)
-    with c2:
-        st.markdown('<div class="stop-btn">', unsafe_allow_html=True)
-        stop_btn = st.button("⏹ PARAR", use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    stop_btn  = c2.button("⏹ PARAR",  use_container_width=True)
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("# 🎯 Seven Levels Bot")
-st.markdown(f"*MA7 + MACD · {SYMBOL_LABELS.get(symbol, symbol)} · {duration} · Modo: **{mode.upper()}***")
+sym_label = VOLATILITY_SYMBOLS.get(symbol, symbol)
+st.markdown(f"*MA7 + MACD · **{sym_label}** · {duration} · {mode.upper()}*")
 
-manager = st.session_state.manager
+manager    = st.session_state.manager
 is_running = manager.is_running()
-stop_reason = manager.stop_reason()
+stop_rsn   = manager.stop_reason()
 
 if is_running:
-    st.markdown(f'<div class="banner-running"><span class="dot-green"></span>'
-                f'<b>BOT A OPERAR AUTOMATICAMENTE</b> — '
-                f'{SYMBOL_LABELS.get(symbol,symbol)} | {mode.upper()}</div>',
-                unsafe_allow_html=True)
-elif stop_reason and "META" in stop_reason:
-    st.markdown(f'<div class="banner-goal">🏆 <b>{stop_reason}</b></div>',
-                unsafe_allow_html=True)
-elif stop_reason:
-    st.markdown(f'<div class="banner-stopped"><span class="dot-red"></span>'
-                f'<b>BOT PARADO:</b> {stop_reason}</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="banner-running"><span class="dot-green"></span>'
+        f'<b>BOT A OPERAR</b> — {sym_label} | {mode.upper()} | '
+        f'Para quando ganhar ${goal:.2f} ou perder ${stop_loss:.2f}</div>',
+        unsafe_allow_html=True)
+elif "META" in stop_rsn:
+    st.markdown(f'<div class="banner-goal">🏆 {stop_rsn}</div>', unsafe_allow_html=True)
+elif stop_rsn:
+    st.markdown(
+        f'<div class="banner-stopped"><span class="dot-red"></span>'
+        f'<b>PARADO:</b> {stop_rsn}</div>', unsafe_allow_html=True)
 else:
-    st.markdown(f'<div class="banner-stopped"><span class="dot-red"></span>'
-                f'<b>BOT OFFLINE</b> — Clica ▶ INICIAR para começar</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="banner-stopped"><span class="dot-red"></span>'
+        '<b>OFFLINE</b> — Clica ▶ INICIAR</div>', unsafe_allow_html=True)
 
 # ── Métricas ──────────────────────────────────────────────────────────────────
 stats = manager.stats()
-
 m1,m2,m3,m4,m5,m6 = st.columns(6)
 with m1:
-    cls = "profit" if stats["pnl"] >= 0 else "loss"
-    st.markdown(f'<div class="metric-card"><div class="metric-label">P&L TOTAL</div>'
-                f'<div class="{cls}">${stats["pnl"]:.2f}</div></div>', unsafe_allow_html=True)
+    cls = "profit" if stats["pnl"]>=0 else "loss"
+    st.markdown(f'<div class="metric-card"><div class="metric-label">P&L SESSÃO</div>'
+                f'<div class="{cls}">${stats["pnl"]:+.2f}</div></div>', unsafe_allow_html=True)
 with m2:
     st.markdown(f'<div class="metric-card"><div class="metric-label">TRADES</div>'
                 f'<div class="neutral">{stats["trades"]}</div></div>', unsafe_allow_html=True)
@@ -1000,34 +880,34 @@ with m3:
     st.markdown(f'<div class="metric-card"><div class="metric-label">WIN RATE</div>'
                 f'<div class="{wc}">{stats["winrate"]:.1f}%</div></div>', unsafe_allow_html=True)
 with m4:
-    st.markdown(f'<div class="metric-card"><div class="metric-label">WINS</div>'
+    st.markdown(f'<div class="metric-card"><div class="metric-label">WINS ✅</div>'
                 f'<div class="profit">{stats["wins"]}</div></div>', unsafe_allow_html=True)
 with m5:
-    st.markdown(f'<div class="metric-card"><div class="metric-label">LOSSES</div>'
+    st.markdown(f'<div class="metric-card"><div class="metric-label">LOSSES ❌</div>'
                 f'<div class="loss">{stats["losses"]}</div></div>', unsafe_allow_html=True)
 with m6:
     cl   = stats["consec_losses"]
-    cl_c = "loss" if cl >= max_consec else ("warn" if cl >= max_consec-1 else "neutral")
+    cl_c = "loss" if cl>=3 else ("warn" if cl>=2 else "neutral")
     st.markdown(f'<div class="metric-card"><div class="metric-label">CONS.LOSS</div>'
                 f'<div class="{cl_c}">{cl}</div></div>', unsafe_allow_html=True)
 
 st.markdown("")
 
-# ── Barras de progresso ───────────────────────────────────────────────────────
-prog_col1, prog_col2 = st.columns(2)
-with prog_col1:
+# Barras de progresso baseadas em P&L
+pc1, pc2 = st.columns(2)
+with pc1:
     gp = min(1.0, max(0, stats["pnl"]) / goal) if goal > 0 else 0
-    st.markdown(f"**🎯 Meta: ${max(0,stats['pnl']):.2f} / ${goal:.2f} ({gp*100:.1f}%)**")
+    st.markdown(f"**🎯 Ganho: ${max(0,stats['pnl']):.2f} / Meta: ${goal:.2f} ({gp*100:.1f}%)**")
     st.progress(gp)
-with prog_col2:
+with pc2:
     lp = min(1.0, abs(min(0,stats["pnl"])) / stop_loss) if stop_loss > 0 else 0
-    lc = "🔴" if lp > 0.7 else ("🟡" if lp > 0.4 else "🟢")
-    st.markdown(f"**{lc} Stop Loss: ${abs(min(0,stats['pnl'])):.2f} / ${stop_loss:.2f}**")
+    ic = "🔴" if lp>0.7 else ("🟡" if lp>0.4 else "🟢")
+    st.markdown(f"**{ic} Perda: ${abs(min(0,stats['pnl'])):.2f} / Stop: ${stop_loss:.2f}**")
     st.progress(lp)
 
 st.markdown("")
 
-# ── Layout principal ──────────────────────────────────────────────────────────
+# ── Layout ────────────────────────────────────────────────────────────────────
 left, right = st.columns([2,1])
 
 with left:
@@ -1036,30 +916,28 @@ with left:
     if trades:
         df = pd.DataFrame(trades)
         df["resultado"] = df["profit"].apply(
-            lambda x: f"✅ +${x:.2f}" if x > 0 else f"❌ -${abs(x):.2f}")
+            lambda x: f"✅ +${x:.2f}" if x>0 else f"❌ -${abs(x):.2f}")
         cols = [c for c in ["time","level","symbol","direction","stake","resultado","signal"]
                 if c in df.columns]
         st.dataframe(df[cols].tail(25), use_container_width=True, hide_index=True)
 
-        if mode == "suicida" and len(trades) > 0:
-            st.markdown("#### 🔥 Progresso dos Níveis (Suicida)")
-            for t in trades[-7:]:
-                icon   = "✅" if t["profit"] > 0 else "❌"
-                color  = "#00d4aa" if t["profit"] > 0 else "#ff4d6d"
+        if mode=="suicida" and trades:
+            st.markdown("#### 🔥 Níveis Suicida")
+            for t in trades[-6:]:
+                ic  = "✅" if t["profit"]>0 else "❌"
+                col = "#00d4aa" if t["profit"]>0 else "#ff4d6d"
+                after = t["stake"] + t["profit"]
                 st.markdown(
                     f'<div class="level-bar">'
-                    f'<span style="color:{color}">{icon}</span> '
-                    f'<b>Nível {t.get("level","?")}:</b> '
-                    f'${t["stake"]:.2f} → '
-                    f'<span style="color:{color}">${t["stake"]+t["profit"]:.2f}</span> '
-                    f'({t["direction"]} | {t["time"]})'
-                    f'</div>',
+                    f'<span style="color:{col}">{ic} Nível {t.get("level","?")}:</span> '
+                    f'${t["stake"]:.2f} → <b style="color:{col}">${after:.2f}</b> '
+                    f'| {t["direction"]} | {t["time"]}</div>',
                     unsafe_allow_html=True)
     else:
-        st.info("🤖 Nenhum trade ainda. Clica ▶ INICIAR e o bot opera sozinho.")
+        st.info("🤖 Clica ▶ INICIAR — o bot opera sozinho até atingir meta ou stop.")
 
 with right:
-    st.markdown("### 🔍 Sinais (MA7 + MACD)")
+    st.markdown("### 🔍 Sinais MA7+MACD")
     signals = manager.get_signals()
     if signals:
         for s in signals[-10:]:
@@ -1069,25 +947,25 @@ with right:
             ico = "🟢" if s["dir"]=="CALL" else ("🔴" if s["dir"]=="PUT" else "🟡")
             st.markdown(
                 f'<div class="{bc}">{ico} <b>{s["dir"]}</b> {s["time"]}<br>'
-                f'<span style="color:#7c9cbf;font-size:.75rem">{s["reason"]}</span></div>',
+                f'<span style="color:#7c9cbf;font-size:.74rem">{s["reason"]}</span></div>',
                 unsafe_allow_html=True)
     else:
-        st.info("Aguardando sinais MA7+MACD...")
+        st.info("Aguardando sinal MA7+MACD...")
 
-    st.markdown("### 📋 Log ao Vivo")
+    st.markdown("### 📋 Log")
     logs = manager.get_logs()
     html = ""
-    for e in logs[-16:]:
-        cor = ("#00d4aa" if "✅" in e or "META" in e or "🎯" in e
-               else "#ff4d6d" if "❌" in e or "💥" in e or "🛑" in e or "💀" in e
-               else "#f59e0b" if "⏳" in e or "📡" in e or "🔥" in e
-               else "#a0c0ff" if "📝" in e or "📊" in e
+    for e in logs[-18:]:
+        cor = ("#00d4aa" if any(x in e for x in ["✅","META","🎯","WIN"])
+               else "#ff4d6d" if any(x in e for x in ["❌","💥","🛑","💀","LOSS"])
+               else "#f59e0b" if any(x in e for x in ["⏳","📡","🔥","💸"])
+               else "#a0c0ff" if any(x in e for x in ["📝","📊","✅ Con"])
                else "#7c9cbf")
-        html += (f'<div style="font-family:JetBrains Mono,monospace;font-size:.73rem;'
+        html += (f'<div style="font-family:JetBrains Mono,monospace;font-size:.72rem;'
                  f'color:{cor};padding:2px 0;border-bottom:1px solid #0d1520">{e}</div>')
     st.markdown(
         f'<div style="background:#111827;border-radius:8px;padding:12px;'
-        f'max-height:350px;overflow-y:auto">{html}</div>',
+        f'max-height:380px;overflow-y:auto">{html}</div>',
         unsafe_allow_html=True)
 
 # ── Start / Stop ──────────────────────────────────────────────────────────────
@@ -1115,25 +993,16 @@ if start_btn:
         bot = SevenLevelsBot(cfg, manager)
         st.session_state.bot     = bot
         st.session_state.running = True
-        threading.Thread(
-            target=lambda: asyncio.run(bot.run()),
-            daemon=True).start()
-
-        label = SYMBOL_LABELS.get(symbol, symbol)
-        st.success(f"✅ Bot iniciado! {label} | {mode.upper()} | Meta: ${goal:.2f}")
-        time.sleep(1)
-        st.rerun()
+        threading.Thread(target=lambda: asyncio.run(bot.run()), daemon=True).start()
+        st.success(f"✅ Bot iniciado! {sym_label} | {mode.upper()} | Meta: +${goal:.2f}")
+        time.sleep(1); st.rerun()
 
 if stop_btn:
-    if st.session_state.bot:
-        st.session_state.bot.stop()
-    manager.set_running(False, "Parado manualmente pelo utilizador")
+    if st.session_state.bot: st.session_state.bot.stop()
+    manager.set_running(False, "Parado manualmente")
     st.session_state.running = False
-    st.warning("⏹ Bot parado manualmente.")
-    time.sleep(1)
-    st.rerun()
+    st.warning("⏹ Bot parado.")
+    time.sleep(1); st.rerun()
 
-# Auto-refresh quando o bot está a correr
 if manager.is_running():
-    time.sleep(3)
-    st.rerun()
+    time.sleep(3); st.rerun()
